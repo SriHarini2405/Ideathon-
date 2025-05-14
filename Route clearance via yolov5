@@ -1,0 +1,182 @@
+import torch
+import numpy as np
+from PIL import Image, ImageTk, ImageDraw
+import tkinter as tk
+from picamera2 import Picamera2
+from gpiozero import LED
+from time import time, sleep
+
+# Load YOLOv5 model
+try:
+    model = torch.hub.load('ultralytics/yolov5', 'custom', path='/home/Yashwanth/ambulance_project/yolov5/best.pt', force_reload=True)
+    model.conf = 0.6  # Confidence threshold
+except Exception as e:
+    print(f"Error loading YOLOv5 model: {e}")
+    exit(1)
+
+# Initialize cameras safely
+try:
+    available_cams = Picamera2.global_camera_info()
+    print("Available Cameras:", available_cams)
+
+    if len(available_cams) < 2:
+        print("Error: Less than 2 cameras detected.")
+        exit(1)
+
+    cam1 = Picamera2(0)
+    cam2 = Picamera2(1)
+
+    for cam in [cam1, cam2]:
+        cam.preview_configuration.main.size = (640, 640)
+        cam.preview_configuration.main.format = "RGB888"
+        cam.configure("preview")
+        cam.start()
+        sleep(1)  # Allow warm-up
+except Exception as e:
+    print(f"Camera initialization error: {e}")
+    exit(1)
+
+# GPIO pin setup
+try:
+    red1, yellow1, green1 = LED(17), LED(27), LED(22)  # Lane 1
+    red2, yellow2, green2 = LED(5), LED(6), LED(13)    # Lane 2
+except Exception as e:
+    print(f"GPIO initialization error: {e}")
+    exit(1)
+
+def set_signal(lane, state):
+    leds = [(red1, yellow1, green1), (red2, yellow2, green2)][lane - 1]
+    red, yellow, green = leds
+    red.off(); yellow.off(); green.off()
+    if state == "RED": red.on()
+    elif state == "YELLOW": yellow.on()
+    elif state == "GREEN": green.on()
+# GUI setup
+window = tk.Tk()
+window.title("Ambulance Detection - Lane View")
+label1 = tk.Label(window)
+label1.grid(row=0, column=0)
+label2 = tk.Label(window)
+label2.grid(row=0, column=1)
+
+# State variables
+amb_override1 = False
+amb_override2 = False
+signal_stage1 = "RED"
+signal_stage2 = "RED"
+stage_start1 = time()
+stage_start2 = time()
+
+def detect_ambulance(frame):
+    try:
+        results = model(frame, size=640)
+        detections = results.pandas().xyxy[0]
+        print("Detections:", detections)  # Debug
+        for _, row in detections.iterrows():
+            if 'name' in row and isinstance(row['name'], str):
+                if "ambulance" in row['name'].lower() and row['confidence'] > 0.6:
+                    return True, (int(row['xmin']), int(row['ymin']), int(row['xmax']), int(row['ymax']), row['confidence'])
+    except Exception as e:
+        print(f"Detection error: {e}")
+    return False, None
+
+def process_camera(cam, label, cam_no):
+    global amb_override1, amb_override2
+    global signal_stage1, signal_stage2, stage_start1, stage_start2
+
+    try:
+        frame = cam.capture_array()
+    except Exception as e:
+        print(f"Camera capture error (cam{cam_no}): {e}")
+        return
+
+    now = time()
+    amb_detected, box = detect_ambulance(frame)
+    now = time()
+    amb_detected, box = detect_ambulance(frame)
+
+    img = Image.fromarray(frame)
+    draw = ImageDraw.Draw(img)
+    if amb_detected and box:
+        x1, y1, x2, y2, conf = box
+        draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
+        draw.text((x1, y1 - 10), f"Ambulance {conf:.2f}", fill="red")
+
+    if cam_no == 1:
+        if amb_detected:
+            amb_override1 = True
+            amb_override2 = False
+            set_signal(1, "GREEN")
+            set_signal(2, "RED")
+        else:
+            if amb_override1:
+                amb_override1 = False
+                set_signal(1, "RED")
+                signal_stage1 = "RED"
+                stage_start1 = now
+        if not amb_override1 and not amb_override2:
+            if signal_stage1 == "RED" and now - stage_start1 >= 10:
+                if signal_stage2 != "GREEN":
+                    set_signal(1, "YELLOW")
+                    signal_stage1 = "YELLOW"
+                    stage_start1 = now
+            elif signal_stage1 == "YELLOW" and now - stage_start1 >= 3:
+                if signal_stage2 != "GREEN":
+                    set_signal(1, "GREEN")
+                    signal_stage1 = "GREEN"
+                    stage_start1 = now
+            elif signal_stage1 == "GREEN" and now - stage_start1 >= 8:
+                set_signal(1, "RED")
+                signal_stage1 = "RED"
+                stage_start1 = now
+
+    elif cam_no == 2:
+        if amb_detected:
+            amb_override2 = True
+            amb_override1 = False
+            set_signal(2, "GREEN")
+            set_signal(1, "RED")
+        else:
+            if amb_override2:
+                amb_override2 = False
+                 set_signal(2, "RED")
+                signal_stage2 = "RED"
+                stage_start2 = now
+        if not amb_override1 and not amb_override2:
+            if signal_stage2 == "RED" and now - stage_start2 >= 10:
+                if signal_stage1 != "GREEN":
+                    set_signal(2, "YELLOW")
+                    signal_stage2 = "YELLOW"
+                    stage_start2 = now
+            elif signal_stage2 == "YELLOW" and now - stage_start2 >= 3:
+                if signal_stage1 != "GREEN":
+                    set_signal(2, "GREEN")
+                    signal_stage2 = "GREEN"
+                    stage_start2 = now
+            elif signal_stage2 == "GREEN" and now - stage_start2 >= 8:
+                set_signal(2, "RED")
+                signal_stage2 = "RED"
+                stage_start2 = now
+
+    img_tk = ImageTk.PhotoImage(image=img)
+    label.imgtk = img_tk
+    label.configure(image=img_tk)
+
+def update_frame():
+    process_camera(cam1, label1, cam_no=1)
+    process_camera(cam2, label2, cam_no=2)
+    window.after(100, update_frame)
+
+# Start logic
+set_signal(1, "RED")
+set_signal(2, "RED")
+update_frame()
+
+try:
+    window.mainloop()
+except KeyboardInterrupt:
+    print("Program terminated")
+
+# Cleanup
+set_signal(1, "RED")
+set_signal(2, "RED")
