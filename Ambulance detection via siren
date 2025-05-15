@@ -1,0 +1,36 @@
+import tensorflow as tf
+import numpy as np
+import librosa
+
+# File paths
+model_path = '/home/pi/yamnet_project/yamnet_model'
+audio_file = '/home/pi/yamnet_project/ambulance-312230.mp3'
+csv_file = '/home/pi/yamnet_project/yamnet_class_map.csv'
+
+# Load the YAMNet model
+model = tf.saved_model.load(model_path)
+
+# Load audio at 16kHz
+waveform, sr = librosa.load(audio_file, sr=16000)
+
+# Run model prediction
+scores, embeddings, spectrogram = model(waveform)
+
+# Load class names from CSV file
+with open(csv_file, 'r') as f:
+    class_names = [line.strip().split(',')[2] for line in f.readlines()[1:]]
+
+# Compute mean prediction scores
+mean_scores = np.mean(scores, axis=0)
+
+# Index for "Ambulance (siren)"
+ambulance_idx = class_names.index('Ambulance (siren)')
+
+# Set detection threshold
+threshold = 0.2  # adjust if needed based on testing
+
+# Check if ambulance is detected
+if mean_scores[ambulance_idx] > threshold:
+    print("✅ Ambulance detected")
+else:
+    print("❌ Ambulance not detected")
